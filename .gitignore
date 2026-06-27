@@ -1,0 +1,21 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Generated images
+output/*
+!output/.gitkeep
+
+# Local quantized-model cache (large)
+models/
+
+# Claude Code local state
+.claude/
+
+# Editor / tooling
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

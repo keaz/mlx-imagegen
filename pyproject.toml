@@ -1,0 +1,12 @@
+[project]
+name = "mlx-imagegen"
+version = "0.1.0"
+description = "Interactive MLX image generator (FLUX via mflux) with selectable models and style modes"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "mflux",
+]
+
+[tool.uv]
+package = false
