@@ -8,6 +8,7 @@ output resolution on the fly with slash commands:
     /model   choose the generation model
     /mode    choose a style preset (realistic / cartoon / anime / sketch)
     /res     choose output resolution (1080 / 4K / 8K)
+    /person  use an optional reference photo of a person (FLUX Kontext)
     /voice   speak your prompt instead of typing it (local Whisper)
     /help    show commands
     /exit    quit
@@ -67,6 +68,14 @@ MODELS: dict[str, dict] = {
     },
 }
 DEFAULT_MODEL = "schnell-4bit"
+
+# Person/reference generation uses FLUX.1 Kontext-dev (gated): it conditions on
+# a single reference photo + the prompt to place that person in a new scene.
+# Recommended dev settings are ~28 steps and guidance ~2.5; quantized to 4-bit
+# to fit comfortably in memory.
+KONTEXT_QUANTIZE = 4
+KONTEXT_STEPS = 28
+KONTEXT_GUIDANCE = 2.5
 
 # Style modes. These are prompt presets: the keywords are appended to whatever
 # the user types so one model can produce different looks with no extra weights.
@@ -158,15 +167,21 @@ def res_items() -> list[tuple[str, str, str]]:
 def banner() -> None:
     print()
     print("  " + bold(cyan("mlx-imagegen")) + dim("  ·  FLUX diffusion on Apple Silicon (MLX)"))
-    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /res /voice /help /exit"))
+    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /res /person /voice /help /exit"))
 
 
 def show_status(app: "App") -> None:
-    spec = MODELS[app.model_key]
+    if app.ref_image:
+        head = dim("  model: ") + bold("FLUX.1 Kontext-dev")
+        person = dim("    person: ") + bold(Path(app.ref_image).name)
+    else:
+        head = dim("  model: ") + bold(MODELS[app.model_key]["label"])
+        person = ""
     print(
-        dim("  model: ") + bold(spec["label"])
+        head
         + dim("    mode: ") + bold(app.mode_key)
         + dim("    res: ") + bold(app.res_key)
+        + person
         + dim(f"    output: {OUTPUT_DIR.name}/")
     )
 
@@ -177,6 +192,7 @@ def show_help() -> None:
     print("    " + bold("/model") + dim("   choose the generation model"))
     print("    " + bold("/mode") + dim("    choose a style preset (realistic / cartoon / anime / sketch)"))
     print("    " + bold("/res") + dim("     choose output resolution (1080 / 4K / 8K)"))
+    print("    " + bold("/person") + dim("  use a reference photo of a person (FLUX Kontext) · /person clear to turn off"))
     print("    " + bold("/voice") + dim("   speak your prompt instead of typing (local Whisper)"))
     print("    " + bold("/help") + dim("    show this help"))
     print("    " + bold("/exit") + dim("    quit (Ctrl-D also works)"))
@@ -219,8 +235,10 @@ class App:
         self.model_key = DEFAULT_MODEL
         self.mode_key = DEFAULT_MODE
         self.res_key = DEFAULT_RES
+        self.ref_image: str | None = None  # optional person/reference photo (Kontext)
         self._flux = None        # cached mflux Flux1 instance
         self._flux_key = None    # which model_key the cache holds
+        self._kontext = None     # cached mflux Flux1Kontext instance (reference mode)
 
     def _load_flux(self):
         """Return a loaded Flux1 for the active model, (re)loading if needed.
@@ -281,11 +299,40 @@ class App:
         self._flux_key = self.model_key
         return flux
 
-    def generate(self, user_prompt: str) -> Path | None:
-        """Generate one image for the prompt and save it. Returns the path."""
-        spec = MODELS[self.model_key]
-        prompt = build_prompt(user_prompt, self.mode_key)
+    def _load_kontext(self):
+        """Load FLUX.1 Kontext-dev, used for person/reference generation.
 
+        Kontext is a separate (gated) model; loading it frees the text-to-image
+        model so only one large model sits in memory at a time. It has no
+        quantized-save support, so it loads from the Hugging Face cache and
+        re-quantizes on each launch (slower startup than the cached schnell).
+        """
+        if self._kontext is not None:
+            return self._kontext
+        # Free the txt2img model so we don't hold two large models at once.
+        self._flux = None
+        self._flux_key = None
+        try:
+            from mflux.models.common.config.model_config import ModelConfig
+            from mflux.models.flux.variants.kontext.flux_kontext import Flux1Kontext
+        except Exception as e:  # pragma: no cover - environment/setup issue
+            raise RuntimeError(f"Could not import mflux Kontext: {e}") from e
+        info("Loading FLUX.1 Kontext-dev · 4-bit … "
+             + dim("(gated; first use downloads the model, then cached; re-quantizes each launch)"))
+        kontext = Flux1Kontext(model_config=ModelConfig.dev_kontext(), quantize=KONTEXT_QUANTIZE)
+        self._kontext = kontext
+        return kontext
+
+    def generate(self, user_prompt: str) -> Path | None:
+        """Generate one image and save it. Uses the person reference (Kontext)
+        when one is set, otherwise plain text-to-image. Returns the path."""
+        prompt = build_prompt(user_prompt, self.mode_key)
+        if self.ref_image:
+            return self._generate_with_reference(prompt)
+        return self._generate_txt2img(prompt)
+
+    def _generate_txt2img(self, prompt: str) -> Path | None:
+        spec = MODELS[self.model_key]
         try:
             flux = self._load_flux()
         except Exception as e:
@@ -295,13 +342,10 @@ class App:
                      "https://huggingface.co/black-forest-labs/FLUX.1-dev and run "
                      + bold("uv run huggingface-cli login"))
             return None
+        self._kontext = None  # free the reference model if it was loaded
 
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = OUTPUT_DIR / timestamp_filename()
-        seed = random.randint(0, 2**32 - 1)
         res = RESOLUTIONS[self.res_key]
-        target = res["size"]
-
+        seed = random.randint(0, 2**32 - 1)
         info(f"Generating {GEN_BASE_W}×{GEN_BASE_H} render → {res['label']}, "
              f"{spec['steps']} steps, seed {seed} " + dim(f"[mode: {self.mode_key}]"))
         start = time.monotonic()
@@ -318,23 +362,62 @@ class App:
             warn("Generation cancelled.")
             return None
         except Exception as e:
-            # mflux raises StopImageGenerationException on Ctrl-C mid-loop.
             if type(e).__name__ == "StopImageGenerationException":
                 warn("Generation cancelled.")
             else:
                 err(f"Generation failed: {e}")
             return None
+        return self._finish_image(generated, start)
 
-        # FLUX renders at the native base size; scale up to the chosen resolution.
+    def _generate_with_reference(self, prompt: str) -> Path | None:
+        try:
+            kontext = self._load_kontext()
+        except Exception as e:
+            err(str(e))
+            info("FLUX.1 Kontext-dev is gated. Accept the license at "
+                 "https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev and run "
+                 + bold("uv run huggingface-cli login"))
+            return None
+
+        res = RESOLUTIONS[self.res_key]
+        seed = random.randint(0, 2**32 - 1)
+        info(f"Generating from reference {bold(Path(self.ref_image).name)} → {res['label']}, "
+             f"{KONTEXT_STEPS} steps, seed {seed} " + dim(f"[mode: {self.mode_key}]"))
+        start = time.monotonic()
+        try:
+            generated = kontext.generate_image(
+                seed=seed,
+                prompt=prompt,
+                num_inference_steps=KONTEXT_STEPS,
+                height=GEN_BASE_H,
+                width=GEN_BASE_W,
+                guidance=KONTEXT_GUIDANCE,
+                image_path=self.ref_image,
+            )
+        except KeyboardInterrupt:
+            warn("Generation cancelled.")
+            return None
+        except Exception as e:
+            if type(e).__name__ == "StopImageGenerationException":
+                warn("Generation cancelled.")
+            else:
+                err(f"Generation failed: {e}")
+            return None
+        return self._finish_image(generated, start)
+
+    def _finish_image(self, generated, start: float) -> Path:
+        """Upscale the native render to the chosen resolution and save it."""
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = OUTPUT_DIR / timestamp_filename()
+        target = RESOLUTIONS[self.res_key]["size"]
         from PIL import Image
         img = generated.image
         if img.size != target:
             info(f"Upscaling {img.size[0]}×{img.size[1]} → {target[0]}×{target[1]} " + dim("(Lanczos)"))
             img = img.resize(target, Image.Resampling.LANCZOS)
         img.save(out_path)
-
         elapsed = time.monotonic() - start
-        ok(f"Saved {bold(str(out_path))} " + dim(f"{target[0]}×{target[1]}") + f"  " + dim(f"({elapsed:.1f}s)"))
+        ok(f"Saved {bold(str(out_path))} " + dim(f"{target[0]}×{target[1]}") + "  " + dim(f"({elapsed:.1f}s)"))
         return out_path
 
 
@@ -413,6 +496,48 @@ def do_voice(app: "App") -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Person / reference photo (optional, FLUX Kontext)                           #
+# --------------------------------------------------------------------------- #
+
+def set_reference(app: "App", raw: str) -> None:
+    """Set or clear the optional person/reference photo used by Kontext.
+
+    Usage: ``/person <path-to-photo>`` to set, ``/person clear`` to turn off.
+    With no argument it reports usage.
+    """
+    parts = raw.split(maxsplit=1)
+    arg = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else ""
+
+    if arg.lower() in ("", "clear", "off", "none"):
+        if app.ref_image:
+            app.ref_image = None
+            app._kontext = None  # free the Kontext model
+            ok("Reference cleared — back to text-to-image.")
+        else:
+            info("Usage: " + bold("/person <path-to-photo>") + dim("   ·   /person clear  to turn off"))
+        show_status(app)
+        return
+
+    path = Path(arg).expanduser()
+    if not path.is_file():
+        err(f"No such image: {path}")
+        return
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.verify()
+    except Exception:
+        err(f"Couldn't read '{path.name}' as an image.")
+        return
+
+    app.ref_image = str(path)
+    ok(f"Person reference set: {bold(path.name)}")
+    info("Prompts now place this person in the scene you describe, via FLUX Kontext "
+         + dim("(gated model — first use downloads it).  /person clear to turn off."))
+    show_status(app)
+
+
+# --------------------------------------------------------------------------- #
 # REPL                                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -430,6 +555,8 @@ def handle_command(app: App, raw: str) -> bool:
     elif cmd in ("/res", "/resolution", "/size"):
         app.res_key = choose("Select an output resolution:", res_items(), app.res_key)
         show_status(app)
+    elif cmd in ("/person", "/ref", "/face"):
+        set_reference(app, raw)
     elif cmd in ("/voice", "/speak", "/mic"):
         do_voice(app)
     elif cmd in ("/help", "/?"):

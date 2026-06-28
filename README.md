@@ -10,6 +10,7 @@ Type a prompt, get a PNG. Switch models and style modes on the fly with slash co
 - Apple Silicon Mac (M1 or newer)
 - [`uv`](https://docs.astral.sh/uv/) (manages Python 3.12 + dependencies for you)
 - A microphone — optional, only for the `/voice` speech-to-text command
+- A Hugging Face login — optional, only for gated models (`/person` Kontext, and FLUX.1 dev)
 
 ## Run
 
@@ -42,6 +43,7 @@ rm -rf ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell
 | `/model`  | Choose the generation model (FLUX.1 schnell / dev, 4-bit / 8-bit)   |
 | `/mode`   | Choose a style preset: `realistic`, `cartoon`, `anime`, `sketch`    |
 | `/res`    | Choose output resolution: `1080`, `4K`, `8K`                        |
+| `/person` | Use an optional reference photo of a person (FLUX Kontext)           |
 | `/voice`  | Speak your prompt instead of typing it (local Whisper STT)          |
 | `/help`   | Show available commands and current settings                        |
 | `/exit`   | Quit the program                                                    |
@@ -75,6 +77,22 @@ resampling. You get true 4K/8K *dimensions*, but the detail is that of the ~1.3 
 enlarged — Lanczos makes it bigger, it doesn't invent new detail. For genuinely detailed
 high-res output you'd add a super-resolution pass (e.g. mflux's SeedVR2 upscaler), which
 isn't wired in yet.
+
+## Person reference (optional)
+
+Want images of a specific person? Type `/person path/to/photo.jpg`, then prompt as usual —
+the prompt describes the scene/style and the person comes from the photo, generated with
+[FLUX.1 Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev). Type
+`/person clear` to turn it off and return to plain text-to-image.
+
+- **Optional:** with no reference set, generation works exactly as before.
+- **One photo, no training:** a single clear, front-facing photo works best.
+- **Modes still apply:** e.g. a reference + `anime` mode renders that person as an anime character.
+- **Likeness is approximate:** Kontext keeps the subject recognizably consistent, but it is *not*
+  a pixel-perfect face match — this stack has no dedicated face-identity adapter (e.g. PuLID).
+- **Gated model:** FLUX.1 Kontext-dev needs a one-time Hugging Face login — accept the license on
+  its model page, then run `uv run huggingface-cli login`. The first `/person` generation downloads
+  it (cached afterward; re-quantizes on each launch).
 
 ## Voice input (local speech-to-text)
 
