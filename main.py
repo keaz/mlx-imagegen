@@ -2,11 +2,12 @@
 """mlx-imagegen — an interactive, local image generator.
 
 Runs FLUX diffusion models on Apple Silicon via mflux (MLX). Type a prompt to
-generate a PNG into ./output/<timestamp>.png. Switch models and style modes on
-the fly with slash commands:
+generate a PNG into ./output/<timestamp>.png. Switch models, style modes, and
+output resolution on the fly with slash commands:
 
     /model   choose the generation model
     /mode    choose a style preset (realistic / cartoon / anime / sketch)
+    /res     choose output resolution (1080 / 4K / 8K)
     /help    show commands
     /exit    quit
 
@@ -28,7 +29,20 @@ from pathlib import Path
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 MODELS_DIR = Path(__file__).resolve().parent / "models"  # local quantized-model cache for fast reloads
-IMAGE_SIZE = 1024  # square images; FLUX is trained around 1024x1024
+
+# FLUX renders natively around 1 megapixel; pushing it past ~2 MP causes
+# artifacts and huge memory use. So we always render at this 16:9 base (good
+# quality, fast) and upscale to the chosen output resolution.
+GEN_BASE_W, GEN_BASE_H = 1536, 864  # 16:9, ~1.3 MP, both divisible by 16
+
+# Selectable output resolutions. FLUX can't render 4K/8K directly, so those are
+# upscaled (Lanczos) from the native render; 1080p is a mild upscale.
+RESOLUTIONS: dict[str, dict] = {
+    "1080": {"size": (1920, 1080), "label": "1080p · 1920×1080", "desc": "Full HD · fast, small files (default)"},
+    "4K":   {"size": (3840, 2160), "label": "4K · 3840×2160",    "desc": "Ultra HD · upscaled from native render"},
+    "8K":   {"size": (7680, 4320), "label": "8K · 7680×4320",    "desc": "Upscaled · very large files, slow to encode"},
+}
+DEFAULT_RES = "1080"
 
 # Selectable models. Each maps to an mflux FLUX variant + quantization and the
 # generation settings that suit it. `name` is the mflux model name; `quantize`
@@ -127,6 +141,10 @@ def mode_items() -> list[tuple[str, str, str]]:
     return [(k, k.capitalize(), v["desc"]) for k, v in MODES.items()]
 
 
+def res_items() -> list[tuple[str, str, str]]:
+    return [(k, v["label"], v["desc"]) for k, v in RESOLUTIONS.items()]
+
+
 # --------------------------------------------------------------------------- #
 # Interactive UI                                                              #
 # --------------------------------------------------------------------------- #
@@ -134,7 +152,7 @@ def mode_items() -> list[tuple[str, str, str]]:
 def banner() -> None:
     print()
     print("  " + bold(cyan("mlx-imagegen")) + dim("  ·  FLUX diffusion on Apple Silicon (MLX)"))
-    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /help /exit"))
+    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /res /help /exit"))
 
 
 def show_status(app: "App") -> None:
@@ -142,6 +160,7 @@ def show_status(app: "App") -> None:
     print(
         dim("  model: ") + bold(spec["label"])
         + dim("    mode: ") + bold(app.mode_key)
+        + dim("    res: ") + bold(app.res_key)
         + dim(f"    output: {OUTPUT_DIR.name}/")
     )
 
@@ -151,6 +170,7 @@ def show_help() -> None:
     print(bold("  Commands"))
     print("    " + bold("/model") + dim("   choose the generation model"))
     print("    " + bold("/mode") + dim("    choose a style preset (realistic / cartoon / anime / sketch)"))
+    print("    " + bold("/res") + dim("     choose output resolution (1080 / 4K / 8K)"))
     print("    " + bold("/help") + dim("    show this help"))
     print("    " + bold("/exit") + dim("    quit (Ctrl-D also works)"))
     print()
@@ -186,11 +206,12 @@ def choose(title: str, items: list[tuple[str, str, str]], current_key: str) -> s
 # --------------------------------------------------------------------------- #
 
 class App:
-    """Holds the current model/mode selection and a cached loaded model."""
+    """Holds the current model/mode/resolution selection and a cached model."""
 
     def __init__(self) -> None:
         self.model_key = DEFAULT_MODEL
         self.mode_key = DEFAULT_MODE
+        self.res_key = DEFAULT_RES
         self._flux = None        # cached mflux Flux1 instance
         self._flux_key = None    # which model_key the cache holds
 
@@ -271,17 +292,19 @@ class App:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         out_path = OUTPUT_DIR / timestamp_filename()
         seed = random.randint(0, 2**32 - 1)
+        res = RESOLUTIONS[self.res_key]
+        target = res["size"]
 
-        info(f"Generating {IMAGE_SIZE}×{IMAGE_SIZE}, {spec['steps']} steps, seed {seed} "
-             + dim(f"[mode: {self.mode_key}]"))
+        info(f"Generating {GEN_BASE_W}×{GEN_BASE_H} render → {res['label']}, "
+             f"{spec['steps']} steps, seed {seed} " + dim(f"[mode: {self.mode_key}]"))
         start = time.monotonic()
         try:
-            image = flux.generate_image(
+            generated = flux.generate_image(
                 seed=seed,
                 prompt=prompt,
                 num_inference_steps=spec["steps"],
-                height=IMAGE_SIZE,
-                width=IMAGE_SIZE,
+                height=GEN_BASE_H,
+                width=GEN_BASE_W,
                 guidance=spec["guidance"],
             )
         except KeyboardInterrupt:
@@ -295,9 +318,16 @@ class App:
                 err(f"Generation failed: {e}")
             return None
 
-        image.save(path=out_path, overwrite=True)
+        # FLUX renders at the native base size; scale up to the chosen resolution.
+        from PIL import Image
+        img = generated.image
+        if img.size != target:
+            info(f"Upscaling {img.size[0]}×{img.size[1]} → {target[0]}×{target[1]} " + dim("(Lanczos)"))
+            img = img.resize(target, Image.Resampling.LANCZOS)
+        img.save(out_path)
+
         elapsed = time.monotonic() - start
-        ok(f"Saved {bold(str(out_path))}  " + dim(f"({elapsed:.1f}s)"))
+        ok(f"Saved {bold(str(out_path))} " + dim(f"{target[0]}×{target[1]}") + f"  " + dim(f"({elapsed:.1f}s)"))
         return out_path
 
 
@@ -315,6 +345,9 @@ def handle_command(app: App, raw: str) -> bool:
         show_status(app)
     elif cmd == "/mode":
         app.mode_key = choose("Select a mode:", mode_items(), app.mode_key)
+        show_status(app)
+    elif cmd in ("/res", "/resolution", "/size"):
+        app.res_key = choose("Select an output resolution:", res_items(), app.res_key)
         show_status(app)
     elif cmd in ("/help", "/?"):
         show_help()

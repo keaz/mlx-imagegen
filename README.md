@@ -40,6 +40,7 @@ rm -rf ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell
 | *(prompt)* | Type any text and press Enter to generate an image                 |
 | `/model`  | Choose the generation model (FLUX.1 schnell / dev, 4-bit / 8-bit)   |
 | `/mode`   | Choose a style preset: `realistic`, `cartoon`, `anime`, `sketch`    |
+| `/res`    | Choose output resolution: `1080`, `4K`, `8K`                        |
 | `/help`   | Show available commands and current settings                        |
 | `/exit`   | Quit the program                                                    |
 
@@ -54,6 +55,24 @@ same FLUX model can produce different looks without extra downloads.
 | `cartoon`   | Bold outlines, flat vibrant colors                |
 | `anime`     | Cel-shaded anime key-visual style                 |
 | `sketch`    | Hand-drawn graphite pencil sketch                 |
+
+## Resolution
+
+Pick the output size with `/res` (all 16:9):
+
+| Option | Pixels       | Notes                                          |
+|--------|--------------|------------------------------------------------|
+| `1080` | 1920 × 1080  | Full HD — fast, small files (default)          |
+| `4K`   | 3840 × 2160  | Ultra HD — upscaled from the native render     |
+| `8K`   | 7680 × 4320  | Upscaled — very large PNGs, slow to encode     |
+
+**How it works:** FLUX renders natively around 1 megapixel — it can't generate 4K or 8K
+directly (that causes artifacts and huge memory use). So every image is rendered at a
+FLUX-native **1536 × 864** base and then upscaled to the chosen resolution with Lanczos
+resampling. You get true 4K/8K *dimensions*, but the detail is that of the ~1.3 MP render
+enlarged — Lanczos makes it bigger, it doesn't invent new detail. For genuinely detailed
+high-res output you'd add a super-resolution pass (e.g. mflux's SeedVR2 upscaler), which
+isn't wired in yet.
 
 ## Models
 
