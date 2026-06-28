@@ -8,6 +8,7 @@ output resolution on the fly with slash commands:
     /model   choose the generation model
     /mode    choose a style preset (realistic / cartoon / anime / sketch)
     /res     choose output resolution (1080 / 4K / 8K)
+    /voice   speak your prompt instead of typing it (local Whisper)
     /help    show commands
     /exit    quit
 
@@ -93,6 +94,11 @@ MODES: dict[str, dict] = {
 }
 DEFAULT_MODE = "realistic"
 
+# Local speech-to-text (mlx-whisper). The model downloads once (~1.6 GB) and
+# then runs fully offline — no audio ever leaves the machine.
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+STT_SAMPLE_RATE = 16000  # Whisper expects 16 kHz mono audio
+
 # --------------------------------------------------------------------------- #
 # Tiny terminal styling (no dependencies; disabled when output isn't a TTY)   #
 # --------------------------------------------------------------------------- #
@@ -152,7 +158,7 @@ def res_items() -> list[tuple[str, str, str]]:
 def banner() -> None:
     print()
     print("  " + bold(cyan("mlx-imagegen")) + dim("  ·  FLUX diffusion on Apple Silicon (MLX)"))
-    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /res /help /exit"))
+    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /res /voice /help /exit"))
 
 
 def show_status(app: "App") -> None:
@@ -171,6 +177,7 @@ def show_help() -> None:
     print("    " + bold("/model") + dim("   choose the generation model"))
     print("    " + bold("/mode") + dim("    choose a style preset (realistic / cartoon / anime / sketch)"))
     print("    " + bold("/res") + dim("     choose output resolution (1080 / 4K / 8K)"))
+    print("    " + bold("/voice") + dim("   speak your prompt instead of typing (local Whisper)"))
     print("    " + bold("/help") + dim("    show this help"))
     print("    " + bold("/exit") + dim("    quit (Ctrl-D also works)"))
     print()
@@ -332,6 +339,80 @@ class App:
 
 
 # --------------------------------------------------------------------------- #
+# Speech input — fully local STT via mlx-whisper                              #
+# --------------------------------------------------------------------------- #
+
+def record_and_transcribe() -> str | None:
+    """Record from the mic until Enter, then transcribe locally with Whisper.
+
+    Returns the transcribed text, or None if nothing was captured / on error.
+    Audio libraries and the Whisper model are imported/loaded lazily; the model
+    downloads once (~1.6 GB) and then runs fully offline.
+    """
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except Exception as e:  # pragma: no cover - environment/setup issue
+        err(f"Audio libraries unavailable: {e}")
+        return None
+
+    frames: list = []
+
+    def _callback(indata, _frame_count, _time_info, _status):  # runs on audio thread
+        frames.append(indata.copy())
+
+    print(cyan("  🎤 Recording…") + dim("  speak your prompt, then press Enter to stop"))
+    try:
+        with sd.InputStream(samplerate=STT_SAMPLE_RATE, channels=1, dtype="float32", callback=_callback):
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                print()
+    except Exception as e:
+        err(f"Could not access the microphone: {e}")
+        info("On macOS, allow mic access for your terminal in "
+             "System Settings ▸ Privacy & Security ▸ Microphone.")
+        return None
+
+    if not frames:
+        return None
+    audio = np.concatenate(frames, axis=0).reshape(-1).astype(np.float32)
+    if audio.size < STT_SAMPLE_RATE * 0.3:  # less than ~0.3s of audio
+        return None
+
+    info(f"Transcribing locally with {WHISPER_MODEL.split('/')[-1]} "
+         + dim("(first use downloads the model once, then offline)"))
+    try:
+        import mlx_whisper
+        result = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER_MODEL)
+    except Exception as e:
+        err(f"Transcription failed: {e}")
+        return None
+    return (result.get("text") or "").strip() or None
+
+
+def do_voice(app: "App") -> None:
+    """Record a spoken prompt, let the user confirm/edit it, then generate."""
+    text = record_and_transcribe()
+    if not text:
+        warn("Didn't catch any speech — try again.")
+        return
+    # Print the recognized voice prompt as soon as recording stops (Enter pressed).
+    print()
+    ok("Voice prompt:  " + bold(text))
+    print()
+    try:
+        edited = input(cyan("  [Enter] generate · type to edit · /c cancel ❯ ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if edited == "/c":
+        info("Cancelled.")
+        return
+    app.generate(edited if edited else text)
+
+
+# --------------------------------------------------------------------------- #
 # REPL                                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -349,6 +430,8 @@ def handle_command(app: App, raw: str) -> bool:
     elif cmd in ("/res", "/resolution", "/size"):
         app.res_key = choose("Select an output resolution:", res_items(), app.res_key)
         show_status(app)
+    elif cmd in ("/voice", "/speak", "/mic"):
+        do_voice(app)
     elif cmd in ("/help", "/?"):
         show_help()
     else:

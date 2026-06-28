@@ -9,6 +9,7 @@ Type a prompt, get a PNG. Switch models and style modes on the fly with slash co
 
 - Apple Silicon Mac (M1 or newer)
 - [`uv`](https://docs.astral.sh/uv/) (manages Python 3.12 + dependencies for you)
+- A microphone — optional, only for the `/voice` speech-to-text command
 
 ## Run
 
@@ -41,6 +42,7 @@ rm -rf ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell
 | `/model`  | Choose the generation model (FLUX.1 schnell / dev, 4-bit / 8-bit)   |
 | `/mode`   | Choose a style preset: `realistic`, `cartoon`, `anime`, `sketch`    |
 | `/res`    | Choose output resolution: `1080`, `4K`, `8K`                        |
+| `/voice`  | Speak your prompt instead of typing it (local Whisper STT)          |
 | `/help`   | Show available commands and current settings                        |
 | `/exit`   | Quit the program                                                    |
 
@@ -73,6 +75,20 @@ resampling. You get true 4K/8K *dimensions*, but the detail is that of the ~1.3 
 enlarged — Lanczos makes it bigger, it doesn't invent new detail. For genuinely detailed
 high-res output you'd add a super-resolution pass (e.g. mflux's SeedVR2 upscaler), which
 isn't wired in yet.
+
+## Voice input (local speech-to-text)
+
+Prefer talking to typing? Type `/voice`, speak your prompt, and press Enter to stop. The
+audio is transcribed **locally** with [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)
+(model `whisper-large-v3-turbo`); the text is shown for you to confirm or edit, then it
+generates. Typing still works exactly as before — `/voice` is just an alternative.
+
+- **Fully local:** the Whisper model downloads once (~1.6 GB) and then runs offline — no
+  audio ever leaves your machine.
+- **First use:** macOS asks permission for your terminal to use the microphone
+  (System Settings ▸ Privacy & Security ▸ Microphone).
+- After `heard: …`, press **Enter** to generate, **type** to correct the text first, or
+  **`/c`** to cancel.
 
 ## Models
 
