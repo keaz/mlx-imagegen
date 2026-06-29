@@ -19,9 +19,13 @@ first generation so the prompt appears instantly.
 
 from __future__ import annotations
 
+import json
 import random
+import shutil
+import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +35,7 @@ from pathlib import Path
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 MODELS_DIR = Path(__file__).resolve().parent / "models"  # local quantized-model cache for fast reloads
+LORAS_DIR = Path(__file__).resolve().parent / "loras"    # trained LoRA adapters + their training data/configs
 
 # FLUX renders natively around 1 megapixel; pushing it past ~2 MP causes
 # artifacts and huge memory use. So we always render at this 16:9 base (good
@@ -75,7 +80,45 @@ DEFAULT_MODEL = "schnell-4bit"
 # to fit comfortably in memory.
 KONTEXT_QUANTIZE = 4
 KONTEXT_STEPS = 28
-KONTEXT_GUIDANCE = 2.5
+# 2.5 (mflux default) is for minor edits; full scene changes need 4.0–6.0 to
+# give the text prompt enough force to move away from the reference image.
+KONTEXT_GUIDANCE = 4.0
+
+# LoRA fine-tuning (the "exact person" path). mflux can no longer train FLUX.1,
+# but it trains Z-Image-Turbo natively on Apple Silicon — and that same model
+# loads the trained LoRA for inference. So `/train` produces a Z-Image-Turbo
+# LoRA and `/lora` generates with it: the whole loop stays local, no PyTorch.
+# A loaded LoRA routes generation to Z-Image-Turbo (not FLUX), since the adapter
+# is architecture-specific.
+ZIMAGE_QUANTIZE = 4
+ZIMAGE_STEPS = 9  # Z-Image-Turbo is distilled; ~9 steps, guidance disabled
+
+# Defaults for `/train`. Identity LoRAs want ~10–20 varied photos of one person.
+TRAIN_EPOCHS = 100
+TRAIN_RANK = 16
+TRAIN_LEARNING_RATE = 1e-4
+TRAIN_QUANTIZE = 8        # quantize the base during training for memory headroom on 36 GB
+TRAIN_MAX_RESOLUTION = 1024
+
+
+def zimage_lora_targets(rank: int) -> list[dict]:
+    """LoRA injection targets for Z-Image-Turbo (30 transformer blocks).
+
+    Mirrors mflux's bundled z-image-turbo training template: attention q/k/v/out
+    and the feed-forward projections across all blocks, plus the caption embedder
+    and final layer. These are the layers that carry subject identity.
+    """
+    block_modules = [
+        "attention.to_q", "attention.to_k", "attention.to_v", "attention.to_out.0",
+        "feed_forward.w1", "feed_forward.w2", "feed_forward.w3",
+    ]
+    targets = [
+        {"module_path": f"layers.{{block}}.{m}", "blocks": {"start": 0, "end": 30}, "rank": rank}
+        for m in block_modules
+    ]
+    targets.append({"module_path": "cap_embedder.1", "rank": rank})
+    targets.append({"module_path": "all_final_layer.2-1.linear", "rank": rank})
+    return targets
 
 # Style modes. These are prompt presets: the keywords are appended to whatever
 # the user types so one model can produce different looks with no extra weights.
@@ -167,21 +210,25 @@ def res_items() -> list[tuple[str, str, str]]:
 def banner() -> None:
     print()
     print("  " + bold(cyan("mlx-imagegen")) + dim("  ·  FLUX diffusion on Apple Silicon (MLX)"))
-    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /res /person /voice /help /exit"))
+    print(dim("  Type a prompt to generate an image.  Commands: ") + bold("/model /mode /res /person /train /lora /voice /help /exit"))
 
 
 def show_status(app: "App") -> None:
-    if app.ref_image:
+    # Precedence mirrors generate(): LoRA (Z-Image) → person (Kontext) → FLUX.
+    extra = ""
+    if app.lora_path:
+        head = dim("  model: ") + bold("Z-Image-Turbo")
+        extra = dim("    lora: ") + bold(Path(app.lora_path).name) + dim(f" @ {app.lora_scale:g}")
+    elif app.ref_image:
         head = dim("  model: ") + bold("FLUX.1 Kontext-dev")
-        person = dim("    person: ") + bold(Path(app.ref_image).name)
+        extra = dim("    person: ") + bold(Path(app.ref_image).name)
     else:
         head = dim("  model: ") + bold(MODELS[app.model_key]["label"])
-        person = ""
     print(
         head
         + dim("    mode: ") + bold(app.mode_key)
         + dim("    res: ") + bold(app.res_key)
-        + person
+        + extra
         + dim(f"    output: {OUTPUT_DIR.name}/")
     )
 
@@ -193,11 +240,14 @@ def show_help() -> None:
     print("    " + bold("/mode") + dim("    choose a style preset (realistic / cartoon / anime / sketch)"))
     print("    " + bold("/res") + dim("     choose output resolution (1080 / 4K / 8K)"))
     print("    " + bold("/person") + dim("  use a reference photo of a person (FLUX Kontext) · /person clear to turn off"))
+    print("    " + bold("/train") + dim("   train a LoRA of a person from a photo folder (Z-Image-Turbo)"))
+    print("    " + bold("/lora") + dim("    load/clear a trained LoRA · /lora <file.safetensors> [scale] · /lora clear"))
     print("    " + bold("/voice") + dim("   speak your prompt instead of typing (local Whisper)"))
     print("    " + bold("/help") + dim("    show this help"))
     print("    " + bold("/exit") + dim("    quit (Ctrl-D also works)"))
     print()
     print(dim("  Anything else you type becomes the image prompt."))
+    print(dim("  For the exact same person: /train a folder of their photos, then prompt with the trigger word."))
 
 
 def choose(title: str, items: list[tuple[str, str, str]], current_key: str) -> str:
@@ -236,9 +286,13 @@ class App:
         self.mode_key = DEFAULT_MODE
         self.res_key = DEFAULT_RES
         self.ref_image: str | None = None  # optional person/reference photo (Kontext)
+        self.lora_path: str | None = None   # optional trained LoRA (.safetensors) — routes to Z-Image-Turbo
+        self.lora_scale: float = 1.0        # how strongly the LoRA is applied
         self._flux = None        # cached mflux Flux1 instance
         self._flux_key = None    # which model_key the cache holds
         self._kontext = None     # cached mflux Flux1Kontext instance (reference mode)
+        self._zimage = None      # cached mflux ZImage (Z-Image-Turbo) instance (LoRA mode)
+        self._zimage_sig = None  # (lora_path, lora_scale) the cached zimage was built with
 
     def _load_flux(self):
         """Return a loaded Flux1 for the active model, (re)loading if needed.
@@ -309,9 +363,10 @@ class App:
         """
         if self._kontext is not None:
             return self._kontext
-        # Free the txt2img model so we don't hold two large models at once.
+        # Free the other large models so we don't hold two at once.
         self._flux = None
         self._flux_key = None
+        self._zimage = None
         try:
             from mflux.models.common.config.model_config import ModelConfig
             from mflux.models.flux.variants.kontext.flux_kontext import Flux1Kontext
@@ -323,13 +378,84 @@ class App:
         self._kontext = kontext
         return kontext
 
+    def _load_zimage(self):
+        """Load Z-Image-Turbo with the active LoRA applied, used for `/lora` mode.
+
+        The LoRA is applied at construction time (mflux injects it into the
+        transformer when the model loads), so changing or clearing the LoRA must
+        rebuild the model — we key the cache on (lora_path, lora_scale). Loading
+        this frees the FLUX/Kontext models so only one large model sits in memory.
+        """
+        sig = (self.lora_path, self.lora_scale)
+        if self._zimage is not None and self._zimage_sig == sig:
+            return self._zimage
+        # Free the other large models so we don't hold two at once.
+        self._flux = None
+        self._flux_key = None
+        self._kontext = None
+        self._zimage = None
+        try:
+            from mflux.models.common.config.model_config import ModelConfig
+            from mflux.models.z_image.variants.z_image import ZImage
+        except Exception as e:  # pragma: no cover - environment/setup issue
+            raise RuntimeError(f"Could not import mflux Z-Image: {e}") from e
+
+        lora_paths = [self.lora_path] if self.lora_path else None
+        lora_scales = [self.lora_scale] if self.lora_path else None
+        lora_note = (dim(f"  + LoRA {Path(self.lora_path).name} @ {self.lora_scale:g}")
+                     if self.lora_path else "")
+        info("Loading Z-Image-Turbo · 4-bit … "
+             + dim("(first use downloads the model, then re-quantizes each launch)") + lora_note)
+        zimage = ZImage(
+            model_config=ModelConfig.z_image_turbo(),
+            quantize=ZIMAGE_QUANTIZE,
+            lora_paths=lora_paths,
+            lora_scales=lora_scales,
+        )
+        self._zimage = zimage
+        self._zimage_sig = sig
+        return zimage
+
     def generate(self, user_prompt: str) -> Path | None:
-        """Generate one image and save it. Uses the person reference (Kontext)
-        when one is set, otherwise plain text-to-image. Returns the path."""
+        """Generate one image and save it. Precedence: a loaded LoRA (Z-Image-Turbo)
+        wins, then a person reference (Kontext), otherwise plain text-to-image."""
         prompt = build_prompt(user_prompt, self.mode_key)
+        if self.lora_path:
+            return self._generate_zimage(prompt)
         if self.ref_image:
             return self._generate_with_reference(prompt)
         return self._generate_txt2img(prompt)
+
+    def _generate_zimage(self, prompt: str) -> Path | None:
+        try:
+            zimage = self._load_zimage()
+        except Exception as e:
+            err(str(e))
+            return None
+
+        res = RESOLUTIONS[self.res_key]
+        seed = random.randint(0, 2**32 - 1)
+        info(f"Generating with Z-Image-Turbo + LoRA {bold(Path(self.lora_path).name)} → {res['label']}, "
+             f"{ZIMAGE_STEPS} steps, seed {seed} " + dim(f"[mode: {self.mode_key}]"))
+        start = time.monotonic()
+        try:
+            generated = zimage.generate_image(
+                seed=seed,
+                prompt=prompt,
+                num_inference_steps=ZIMAGE_STEPS,
+                height=GEN_BASE_H,
+                width=GEN_BASE_W,
+            )
+        except KeyboardInterrupt:
+            warn("Generation cancelled.")
+            return None
+        except Exception as e:
+            if type(e).__name__ == "StopImageGenerationException":
+                warn("Generation cancelled.")
+            else:
+                err(f"Generation failed: {e}")
+            return None
+        return self._finish_image(generated, start)
 
     def _generate_txt2img(self, prompt: str) -> Path | None:
         spec = MODELS[self.model_key]
@@ -343,6 +469,7 @@ class App:
                      + bold("uv run huggingface-cli login"))
             return None
         self._kontext = None  # free the reference model if it was loaded
+        self._zimage = None   # free the LoRA model if it was loaded
 
         res = RESOLUTIONS[self.res_key]
         seed = random.randint(0, 2**32 - 1)
@@ -411,7 +538,8 @@ class App:
         out_path = OUTPUT_DIR / timestamp_filename()
         target = RESOLUTIONS[self.res_key]["size"]
         from PIL import Image
-        img = generated.image
+        # FLUX returns a GeneratedImage (.image); Z-Image returns a PIL Image directly.
+        img = getattr(generated, "image", generated)
         if img.size != target:
             info(f"Upscaling {img.size[0]}×{img.size[1]} → {target[0]}×{target[1]} " + dim("(Lanczos)"))
             img = img.resize(target, Image.Resampling.LANCZOS)
@@ -534,6 +662,197 @@ def set_reference(app: "App", raw: str) -> None:
     ok(f"Person reference set: {bold(path.name)}")
     info("Prompts now place this person in the scene you describe, via FLUX Kontext "
          + dim("(gated model — first use downloads it).  /person clear to turn off."))
+    if app.lora_path:
+        warn("A LoRA is loaded and takes precedence over /person. "
+             + dim("Run /lora clear to use this reference instead."))
+    show_status(app)
+
+
+# --------------------------------------------------------------------------- #
+# LoRA + training (the "exact person" path, via Z-Image-Turbo)                #
+# --------------------------------------------------------------------------- #
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _sanitize(name: str) -> str:
+    """Make a filesystem/identifier-safe slug from a folder name."""
+    slug = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name).strip("_")
+    return slug or "lora"
+
+
+def set_lora(app: "App", raw: str) -> None:
+    """Set or clear the active LoRA. Usage: ``/lora <file.safetensors> [scale]``
+    or ``/lora clear``. A loaded LoRA routes generation to Z-Image-Turbo."""
+    parts = raw.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if arg.lower() in ("", "clear", "off", "none"):
+        if app.lora_path:
+            app.lora_path = None
+            app.lora_scale = 1.0
+            app._zimage = None
+            app._zimage_sig = None
+            ok("LoRA cleared — back to FLUX text-to-image.")
+        else:
+            info("Usage: " + bold("/lora <file.safetensors> [scale]")
+                 + dim("   ·   /lora clear  to turn off"))
+        show_status(app)
+        return
+
+    # Optional trailing numeric scale: "path/to.safetensors 0.8"
+    scale = 1.0
+    head = arg.rsplit(maxsplit=1)
+    if len(head) == 2:
+        try:
+            scale = float(head[1])
+            arg = head[0]
+        except ValueError:
+            pass  # no trailing scale; whole arg is the path
+
+    path = Path(arg.strip().strip('"').strip("'")).expanduser()
+    if not path.is_file():
+        err(f"No such LoRA file: {path}")
+        return
+    if path.suffix != ".safetensors":
+        warn(f"Expected a .safetensors LoRA; got {path.name} — trying anyway.")
+
+    app.lora_path = str(path)
+    app.lora_scale = scale
+    app._zimage = None  # force a rebuild with the new LoRA
+    app._zimage_sig = None
+    ok(f"LoRA set: {bold(path.name)} " + dim(f"@ {scale:g}"))
+    info("Generation now uses " + bold("Z-Image-Turbo") + " + this LoRA. "
+         + dim("Prompt with your trigger word.  /lora clear to turn off."))
+    show_status(app)
+
+
+def _ensure_captions(images: list[Path], trigger: str) -> int:
+    """Write a default caption .txt next to any image that lacks one. Returns
+    how many were created. Hand-written captions yield better results."""
+    created = 0
+    for img in images:
+        txt = img.with_suffix(".txt")
+        if not txt.exists():
+            txt.write_text(f"a photo of {trigger}\n", encoding="utf-8")
+            created += 1
+    return created
+
+
+def _write_train_config(data_dir: Path, out_dir: Path, num_images: int) -> Path:
+    """Write an mflux Z-Image-Turbo LoRA training config and return its path."""
+    total_iters = max(1, num_images * TRAIN_EPOCHS)
+    config = {
+        "model": "z-image-turbo",
+        "data": str(data_dir),
+        "seed": 42,
+        "steps": ZIMAGE_STEPS,
+        "guidance": 0.0,
+        "quantize": TRAIN_QUANTIZE,
+        "max_resolution": TRAIN_MAX_RESOLUTION,
+        "low_ram": False,
+        "training_loop": {
+            "num_epochs": TRAIN_EPOCHS,
+            "batch_size": 1,
+            "timestep_low": 4,
+            "timestep_high": ZIMAGE_STEPS,
+        },
+        "optimizer": {"name": "AdamW", "learning_rate": TRAIN_LEARNING_RATE},
+        "checkpoint": {"save_frequency": max(1, total_iters // 4), "output_path": str(out_dir)},
+        "monitoring": None,  # skip preview images/plots for faster training
+        "lora_layers": {"targets": zimage_lora_targets(TRAIN_RANK)},
+    }
+    cfg_path = out_dir / "train.json"
+    cfg_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return cfg_path
+
+
+def _extract_latest_lora(out_dir: Path, name: str) -> Path | None:
+    """Pull the trained LoRA .safetensors out of the newest checkpoint zip."""
+    ckpt_dir = out_dir / "checkpoints"
+    zips = sorted(ckpt_dir.glob("*_checkpoint.zip")) if ckpt_dir.is_dir() else []
+    if not zips:
+        return None
+    latest = zips[-1]  # 7-digit zero-padded step names sort lexicographically
+    with zipfile.ZipFile(latest) as zf:
+        members = [m for m in zf.namelist() if m.endswith("_adapter.safetensors")]
+        if not members:
+            return None
+        dest = LORAS_DIR / f"{name}.safetensors"
+        with zf.open(members[-1]) as src, open(dest, "wb") as out:
+            shutil.copyfileobj(src, out)
+    return dest
+
+
+def do_train(app: "App", raw: str) -> None:
+    """Train a person LoRA from a folder of photos, then auto-load it.
+
+    Usage: ``/train <folder> [trigger-word]``. Trains Z-Image-Turbo locally via
+    mflux (a subprocess), extracts the resulting LoRA, and loads it.
+    """
+    parts = raw.split()
+    if len(parts) < 2:
+        info("Usage: " + bold("/train <folder-of-photos> [trigger-word]"))
+        info(dim("  Put ~10–20 varied photos of ONE person in the folder. A trigger word"))
+        info(dim("  (defaults to the folder name) is what you'll use in prompts afterwards."))
+        return
+
+    data_dir = Path(parts[1]).expanduser()
+    if not data_dir.is_dir():
+        err(f"Not a folder: {data_dir}  " + dim("(make a folder and put the person's photos in it)"))
+        return
+    images = sorted(p for p in data_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+    if not images:
+        err(f"No images (.jpg/.jpeg/.png/.webp) in {data_dir}")
+        return
+
+    trigger = parts[2] if len(parts) > 2 else _sanitize(data_dir.name)
+    if len(images) < 5:
+        warn(f"Only {len(images)} photo(s) found. Identity LoRAs want ~10–20 varied photos "
+             "for a good likeness — fewer tends to overfit to one pose/background.")
+
+    created = _ensure_captions(images, trigger)
+    if created:
+        info(f"Wrote {created} caption file(s) using trigger {bold(trigger)} "
+             + dim("(edit the .txt files next to each photo for better results)"))
+
+    name = _sanitize(data_dir.name)
+    out_dir = LORAS_DIR / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = _write_train_config(data_dir, out_dir, len(images))
+
+    # Free our in-process models; the training subprocess loads its own.
+    app._flux = None
+    app._flux_key = None
+    app._kontext = None
+    app._zimage = None
+    app._zimage_sig = None
+
+    print()
+    info(bold("Training a LoRA") + f" on {len(images)} photo(s) · {TRAIN_EPOCHS} epochs · base Z-Image-Turbo")
+    info(dim(f"  trigger: {trigger}   output: loras/{name}/   "
+             "(first run downloads Z-Image-Turbo; Ctrl-C stops early and keeps the last checkpoint)"))
+    print()
+    cmd = [sys.executable, "-m", "mflux.models.common.cli.train", "--config", str(cfg_path)]
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        warn("Training interrupted — extracting the last saved checkpoint.")
+
+    print()
+    lora_file = _extract_latest_lora(out_dir, name)
+    if lora_file is None:
+        err("No checkpoint was produced, so there's no LoRA to load. "
+            + dim("(check the training output above for errors)"))
+        return
+
+    ok(f"LoRA ready: {bold(str(lora_file))}")
+    app.lora_path = str(lora_file)
+    app.lora_scale = 1.0
+    app._zimage = None
+    app._zimage_sig = None
+    info("Loaded it for you — prompt with the trigger word, e.g. "
+         + bold(f'"{trigger} as an astronaut, cinematic"'))
     show_status(app)
 
 
@@ -557,6 +876,10 @@ def handle_command(app: App, raw: str) -> bool:
         show_status(app)
     elif cmd in ("/person", "/ref", "/face"):
         set_reference(app, raw)
+    elif cmd in ("/train", "/finetune"):
+        do_train(app, raw)
+    elif cmd in ("/lora", "/adapter"):
+        set_lora(app, raw)
     elif cmd in ("/voice", "/speak", "/mic"):
         do_voice(app)
     elif cmd in ("/help", "/?"):

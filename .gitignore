@@ -10,6 +10,12 @@ output/*
 # Local quantized-model cache (large)
 models/
 
+# Trained LoRA adapters, training configs & checkpoints (large / personal)
+loras/
+
+# Personal reference / training photos
+person/
+
 # Claude Code local state
 .claude/
 

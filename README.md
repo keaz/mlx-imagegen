@@ -44,6 +44,8 @@ rm -rf ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell
 | `/mode`   | Choose a style preset: `realistic`, `cartoon`, `anime`, `sketch`    |
 | `/res`    | Choose output resolution: `1080`, `4K`, `8K`                        |
 | `/person` | Use an optional reference photo of a person (FLUX Kontext)           |
+| `/train`  | Train a LoRA of a specific person from a photo folder (Z-Image-Turbo)|
+| `/lora`   | Load/clear a trained LoRA: `/lora <file.safetensors> [scale]` · `/lora clear` |
 | `/voice`  | Speak your prompt instead of typing it (local Whisper STT)          |
 | `/help`   | Show available commands and current settings                        |
 | `/exit`   | Quit the program                                                    |
@@ -94,6 +96,67 @@ the prompt describes the scene/style and the person comes from the photo, genera
   its model page, then run `uv run huggingface-cli login`. The first `/person` generation downloads
   it (cached afterward; re-quantizes on each launch).
 
+## Exact same person (LoRA fine-tuning)
+
+`/person` (Kontext) conditions on a single photo and only *loosely* preserves a face — good
+for "someone like this", not "this exact person". To reliably get the **same** individual,
+train a small **LoRA** on several photos of them, then generate with it.
+
+Because mflux can no longer train FLUX.1, training runs on **Z-Image-Turbo** — a model mflux
+*can* fine-tune locally on Apple Silicon, and which then loads the trained LoRA for inference.
+The whole loop is on-device: no PyTorch, no cloud, no login (Z-Image-Turbo isn't gated).
+
+### 1. Gather photos
+
+Make a folder with ~10–20 varied photos of **one** person (different angles, lighting,
+backgrounds; clear face):
+
+```
+person/thejan/
+  001.jpg
+  002.jpg
+  ...
+```
+
+Fewer than ~5 works but tends to overfit to a single pose/background.
+
+### 2. Train
+
+```
+/train person/thejan thejan
+```
+
+- The second argument is the **trigger word** you'll use in prompts (defaults to the folder name).
+- A caption `.txt` is auto-written next to each photo (`a photo of thejan`). For better results,
+  edit them to describe each scene — caption everything *except* the identity (clothing, setting,
+  pose), so the LoRA learns the face rather than the background.
+- The first run downloads Z-Image-Turbo. Training runs `~100` epochs; **Ctrl-C** stops early and
+  keeps the last checkpoint.
+- Output: `loras/thejan.safetensors`, automatically loaded when training finishes.
+
+### 3. Generate
+
+Prompt using the trigger word — the model now renders that specific person:
+
+```
+thejan as an astronaut on Mars, cinematic
+```
+
+Style `/mode`s and `/res` still apply.
+
+### Loading an existing LoRA
+
+```
+/lora loras/thejan.safetensors        # load (use /lora <file> 0.8 to apply it more weakly)
+/lora clear                           # turn off — back to FLUX text-to-image
+```
+
+- A loaded LoRA **routes generation to Z-Image-Turbo** (not FLUX), since the adapter is
+  architecture-specific. `/lora clear` returns to your selected FLUX model.
+- Trained LoRAs, training configs and checkpoints live under `loras/` (git-ignored).
+- Tuning knobs live near the top of `main.py`: `TRAIN_EPOCHS`, `TRAIN_RANK`, `TRAIN_LEARNING_RATE`,
+  `TRAIN_QUANTIZE`. Raising epochs/rank strengthens likeness but risks overfitting.
+
 ## Voice input (local speech-to-text)
 
 Prefer talking to typing? Type `/voice`, speak your prompt, and press Enter to stop. The
@@ -115,3 +178,36 @@ generates. Typing still works exactly as before — `/voice` is just an alternat
 | `schnell-4bit` | FLUX.1 schnell  | Fastest, 4 steps, Apache-2.0, no login (default)   |
 | `schnell-8bit` | FLUX.1 schnell  | Sharper, slightly more memory                      |
 | `dev-4bit`     | FLUX.1 dev      | Highest quality, ~20 steps, requires Hugging Face login |
+
+## Troubleshooting
+
+### `/person` generates a mosaic or random-pixel image
+
+**Cause:** The FLUX.1 Kontext-dev transformer weights are split across three shard files
+(`diffusion_pytorch_model-00001/00002/00003-of-00003.safetensors`). If the download was
+interrupted, one or more shards may be missing. mflux does not error on a missing shard —
+it silently loads the model with zeros for those layers, which produces garbage output.
+
+**Diagnose:** Check that all three shards are present in the cache:
+
+```bash
+ls ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-Kontext-dev/snapshots/*/transformer/
+```
+
+You should see all three `diffusion_pytorch_model-000{01,02,03}-of-00003.safetensors` symlinks.
+If any are missing, download the absent shard explicitly:
+
+```bash
+uv run hf download black-forest-labs/FLUX.1-Kontext-dev \
+  transformer/diffusion_pytorch_model-00002-of-00003.safetensors \
+  --repo-type model
+```
+
+Replace `00002` with whichever shard number is absent. Each shard is roughly 9 GB, so the
+download takes a while on a slow connection. Once complete, relaunch the app and try again.
+
+### First `/person` generation is slow
+
+Expected — Kontext re-quantizes from the full HuggingFace weights on every launch (unlike
+the text-to-image models which cache a quantized copy). Subsequent generations in the same
+session are fast.
